@@ -234,10 +234,20 @@ def submit_match(payload: MatchCreate, db: Session = Depends(get_db)):
         if match_score >= 0.4:
             lost_id = item.id if item.item_type == "lost" else target_item.id
             found_id = item.id if item.item_type == "found" else target_item.id
+
+            existing_match_stmt = select(ItemMatch).where(ItemMatch.lost_item_id == lost_id, ItemMatch.found_item_id == found_id)
+            existing_match = db.scalar(existing_match_stmt)
+
+            if existing_match is None:
+                item_match = ItemMatch(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence = "medium")  
+                db.add(item_match)
+            else:
+                existing_match.score = Decimal(str(match_score))
+                existing_match.confidence = "medium"
+
+
             match = MatchItem(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence = "medium") 
             matches.append(match)
-            item_match = ItemMatch(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence = "medium")  
-            db.add(item_match)
 
     db.commit()
     return MatchCreateResponse(item_id = item.id, list_of_matches = matches, date = datetime.now(timezone.utc))
