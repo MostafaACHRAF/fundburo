@@ -231,7 +231,19 @@ def submit_match(payload: MatchCreate, db: Session = Depends(get_db)):
         if item.model == target_item.model:
             match_score += 0.1
 
+        if item.lat is not None and target_item.lat is not None:
+            lat_distance = abs(item.lat - target_item.lat)
+            if lat_distance <= 2000:
+                match_score += 0.1
+
+        if item.lng is not None and target_item.lng is not None:
+            lng_distance = abs(item.lng - target_item.lng)
+            if lng_distance <= 2000:
+                match_score += 0.1
+
+
         if match_score >= 0.4:
+            confidence = "high" if match_score >= 0.6 else "medium"
             lost_id = item.id if item.item_type == "lost" else target_item.id
             found_id = item.id if item.item_type == "found" else target_item.id
 
@@ -239,14 +251,14 @@ def submit_match(payload: MatchCreate, db: Session = Depends(get_db)):
             existing_match = db.scalar(existing_match_stmt)
 
             if existing_match is None:
-                item_match = ItemMatch(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence = "medium")  
+                item_match = ItemMatch(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence)  
                 db.add(item_match)
             else:
                 existing_match.score = Decimal(str(match_score))
-                existing_match.confidence = "medium"
+                existing_match.confidence = confidence
 
 
-            match = MatchItem(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence = "medium") 
+            match = MatchItem(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence) 
             matches.append(match)
 
     db.commit()
