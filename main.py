@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+from math import radians, sin, cos, sqrt, atan2
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, EmailStr
@@ -232,15 +233,10 @@ def submit_match(payload: MatchCreate, db: Session = Depends(get_db)):
             match_score += 0.1
 
         if item.lat is not None and target_item.lat is not None:
-            lat_distance = abs(item.lat - target_item.lat)
-            if lat_distance <= 2000:
-                match_score += 0.1
-
-        if item.lng is not None and target_item.lng is not None:
-            lng_distance = abs(item.lng - target_item.lng)
-            if lng_distance <= 2000:
-                match_score += 0.1
-
+            if item.lng is not None and target_item.lng is not None:
+                distance = distance_km(item.lat, item.lng, target_item.lat, target_item.lng)
+                if distance <= 3:
+                    match_score += 0.3
 
         if match_score >= 0.4:
             confidence = "high" if match_score >= 0.6 else "medium"
@@ -251,16 +247,29 @@ def submit_match(payload: MatchCreate, db: Session = Depends(get_db)):
             existing_match = db.scalar(existing_match_stmt)
 
             if existing_match is None:
-                item_match = ItemMatch(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence)  
+                item_match = ItemMatch(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence = confidence)  
                 db.add(item_match)
             else:
                 existing_match.score = Decimal(str(match_score))
                 existing_match.confidence = confidence
 
 
-            match = MatchItem(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence) 
+            match = MatchItem(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence = confidence) 
             matches.append(match)
 
     db.commit()
     return MatchCreateResponse(item_id = item.id, list_of_matches = matches, date = datetime.now(timezone.utc))
+
+def distance_km(lat1, lng1, lat2, lng2):
+    r = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlng = radians(lng2 - lng1)
+    rlat1 = radians(lat1)
+    rlat2 = radians(lat2)
+    a = sin(dlat/2)**2 + cos(rlat1) * cos(rlat2) * sin(dlng/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = r * c
+    return distance
+
+
 
