@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+import json
 from math import radians, sin, cos, sqrt, atan2
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, EmailStr
@@ -12,6 +15,9 @@ from models import AppUser, Item, ItemMatch
 
 
 app = FastAPI(title="LostAndFound API")
+
+GEOCODER_URL = "https://nominatim.openstreetmap.org/search"
+GEOCODER_USER_AGENT = "LostAndFound/1.0 (contact: support@lostandfound.local)"
 
 
 def get_db():
@@ -123,6 +129,67 @@ class MatchCreateResponse(BaseModel):
     list_of_matches: list[MatchItem]
     date: datetime
 
+
+def geocode_address(address_text: str) -> tuple[float | None, float | None]:
+    normalized_address = address_text.strip()
+    if not normalized_address:
+        return None, None
+
+    query = normalized_address
+    if "berlin" not in normalized_address.lower():
+        query = f"{normalized_address}, Berlin, Germany"
+
+    query_params = urlencode(
+        {
+            "q": query,
+            "format": "jsonv2",
+            "limit": 1,
+            "addressdetails": 1,
+        }
+    )
+    request = Request(
+        url=f"{GEOCODER_URL}?{query_params}",
+        headers={"User-Agent": GEOCODER_USER_AGENT},
+    )
+
+    try:
+        with urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None, None
+
+    if not payload:
+        return None, None
+
+    first_result = payload[0]
+    lat = first_result.get("lat")
+    lng = first_result.get("lon")
+    if lat is None or lng is None:
+        return None, None
+
+    try:
+        return float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def resolve_coordinates(
+    address_text: str | None,
+    lat: float | None,
+    lng: float | None,
+) -> tuple[float | None, float | None]:
+    if lat is not None and lng is not None and not (lat == 0.0 and lng == 0.0):
+        return lat, lng
+
+    if address_text is None or not address_text.strip():
+        return lat, lng
+
+    geocoded_lat, geocoded_lng = geocode_address(address_text)
+
+    final_lat = lat if lat is not None else geocoded_lat
+    final_lng = lng if lng is not None else geocoded_lng
+    return final_lat, final_lng
+
 @app.post("/claims", response_model=ClaimCreateResponse)
 def submit_claim(payload: ClaimCreate, db: Session = Depends(get_db)):
     user_stmt = select(AppUser).where(
@@ -135,6 +202,12 @@ def submit_claim(payload: ClaimCreate, db: Session = Depends(get_db)):
         db.add(user)
         db.flush()
 
+    lat, lng = resolve_coordinates(
+        address_text=payload.address_text,
+        lat=payload.lat,
+        lng=payload.lng,
+    )
+
     item = Item(
         user_id=user.id,
         item_type="lost",
@@ -143,8 +216,8 @@ def submit_claim(payload: ClaimCreate, db: Session = Depends(get_db)):
         size=payload.size,
         usage=payload.usage,
         address_text=payload.address_text,
-        lat=payload.lat,
-        lng=payload.lng,
+        lat=lat,
+        lng=lng,
         event_time=payload.event_time,
         feel=payload.feel,
         smell=payload.smell,
@@ -175,6 +248,12 @@ def submit_report(payload: ReportCreate, db: Session = Depends(get_db)):
         db.add(user)
         db.flush()
 
+    lat, lng = resolve_coordinates(
+        address_text=payload.address_text,
+        lat=payload.lat,
+        lng=payload.lng,
+    )
+
     item = Item(
         user_id=user.id,
         item_type="found",
@@ -183,8 +262,8 @@ def submit_report(payload: ReportCreate, db: Session = Depends(get_db)):
         size=payload.size,
         usage=payload.usage,
         address_text=payload.address_text,
-        lat=payload.lat,
-        lng=payload.lng,
+        lat=lat,
+        lng=lng,
         event_time=payload.event_time,
         feel=payload.feel,
         smell=payload.smell,
@@ -270,6 +349,3 @@ def distance_km(lat1, lng1, lat2, lng2):
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     distance = r * c
     return distance
-
-
-
