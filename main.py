@@ -130,6 +130,17 @@ class MatchCreateResponse(BaseModel):
     date: datetime
 
 
+class MatchOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    lost_item_id: int
+    found_item_id: int
+    score: Decimal
+    confidence: str
+    created_at: datetime
+
+
 def calculate_matches_for_item(db: Session, item: Item) -> list[MatchItem]:
     reverse_type = "found" if item.item_type == "lost" else "lost"
     target_items_stmt = select(Item).where(
@@ -362,6 +373,12 @@ def submit_match(payload: MatchCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code = 404, detail = "Item not found") 
     matches = calculate_matches_for_item(db, item)
     return MatchCreateResponse(item_id = item.id, list_of_matches = matches, date = datetime.now(timezone.utc))
+
+
+@app.get("/matches", response_model=list[MatchOut])
+def get_matches(db: Session = Depends(get_db)):
+    stmt = select(ItemMatch).order_by(ItemMatch.created_at.desc())
+    return db.scalars(stmt).all()
 
 def distance_km(lat1, lng1, lat2, lng2):
     r = 6371.0
