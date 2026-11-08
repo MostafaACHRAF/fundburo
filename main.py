@@ -130,6 +130,73 @@ class MatchCreateResponse(BaseModel):
     date: datetime
 
 
+def calculate_matches_for_item(db: Session, item: Item) -> list[MatchItem]:
+    reverse_type = "found" if item.item_type == "lost" else "lost"
+    target_items_stmt = select(Item).where(
+        Item.item_type == reverse_type,
+        Item.status == "active",
+    )
+    target_items = db.scalars(target_items_stmt).all()
+
+    matches: list[MatchItem] = []
+    for target_item in target_items:
+        match_score = 0
+
+        if target_item.event_time is not None and item.event_time is not None:
+            time_distance = abs((item.event_time - target_item.event_time).total_seconds())
+            if time_distance <= 86400:
+                match_score += 0.2
+
+        if item.color == target_item.color:
+            match_score += 0.1
+
+        if item.size == target_item.size:
+            match_score += 0.1
+
+        if item.model == target_item.model:
+            match_score += 0.1
+
+        if item.lat is not None and target_item.lat is not None:
+            if item.lng is not None and target_item.lng is not None:
+                distance = distance_km(item.lat, item.lng, target_item.lat, target_item.lng)
+                if distance <= 3:
+                    match_score += 0.3
+
+        if match_score >= 0.4:
+            confidence = "high" if match_score >= 0.6 else "medium"
+            lost_id = item.id if item.item_type == "lost" else target_item.id
+            found_id = item.id if item.item_type == "found" else target_item.id
+
+            existing_match_stmt = select(ItemMatch).where(
+                ItemMatch.lost_item_id == lost_id,
+                ItemMatch.found_item_id == found_id,
+            )
+            existing_match = db.scalar(existing_match_stmt)
+
+            if existing_match is None:
+                item_match = ItemMatch(
+                    lost_item_id=lost_id,
+                    found_item_id=found_id,
+                    score=Decimal(str(match_score)),
+                    confidence=confidence,
+                )
+                db.add(item_match)
+            else:
+                existing_match.score = Decimal(str(match_score))
+                existing_match.confidence = confidence
+
+            match = MatchItem(
+                lost_item_id=lost_id,
+                found_item_id=found_id,
+                score=Decimal(str(match_score)),
+                confidence=confidence,
+            )
+            matches.append(match)
+
+    db.commit()
+    return matches
+
+
 def geocode_address(address_text: str) -> tuple[float | None, float | None]:
     normalized_address = address_text.strip()
     if not normalized_address:
@@ -230,6 +297,7 @@ def submit_claim(payload: ClaimCreate, db: Session = Depends(get_db)):
     db.add(item)
     db.commit()
     db.refresh(item)
+    calculate_matches_for_item(db, item)
 
     return ClaimCreateResponse(user_id=user.id, item_id=item.id, status=item.status)
 
@@ -276,6 +344,7 @@ def submit_report(payload: ReportCreate, db: Session = Depends(get_db)):
     db.add(item)
     db.commit()
     db.refresh(item)
+    calculate_matches_for_item(db, item)
 
     return ReportCreateResponse(user_id=user.id, item_id=item.id, status=item.status)
 
@@ -291,58 +360,7 @@ def submit_match(payload: MatchCreate, db: Session = Depends(get_db)):
 
     if item is None:
         raise HTTPException(status_code = 404, detail = "Item not found") 
-
-    reverse_type = "found" if item.item_type == "lost" else "lost"
-    target_items_stmt = select(Item).where(
-        Item.item_type == reverse_type,
-        Item.status == "active",
-    )
-    target_items = db.scalars(target_items_stmt).all()
-
-    matches: list[MatchItem] = []
-    for target_item in target_items:
-        match_score = 0
-
-        if target_item.event_time is not None and item.event_time is not None:
-            time_distance = abs((item.event_time - target_item.event_time).total_seconds())
-            if time_distance <= 86400:
-                match_score += 0.2
-
-        if item.color == target_item.color:
-             match_score += 0.1
-
-        if item.size == target_item.size:
-            match_score += 0.1
-
-        if item.model == target_item.model:
-            match_score += 0.1
-
-        if item.lat is not None and target_item.lat is not None:
-            if item.lng is not None and target_item.lng is not None:
-                distance = distance_km(item.lat, item.lng, target_item.lat, target_item.lng)
-                if distance <= 3:
-                    match_score += 0.3
-
-        if match_score >= 0.4:
-            confidence = "high" if match_score >= 0.6 else "medium"
-            lost_id = item.id if item.item_type == "lost" else target_item.id
-            found_id = item.id if item.item_type == "found" else target_item.id
-
-            existing_match_stmt = select(ItemMatch).where(ItemMatch.lost_item_id == lost_id, ItemMatch.found_item_id == found_id)
-            existing_match = db.scalar(existing_match_stmt)
-
-            if existing_match is None:
-                item_match = ItemMatch(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence = confidence)  
-                db.add(item_match)
-            else:
-                existing_match.score = Decimal(str(match_score))
-                existing_match.confidence = confidence
-
-
-            match = MatchItem(lost_item_id = lost_id, found_item_id = found_id, score = Decimal(str(match_score)), confidence = confidence) 
-            matches.append(match)
-
-    db.commit()
+    matches = calculate_matches_for_item(db, item)
     return MatchCreateResponse(item_id = item.id, list_of_matches = matches, date = datetime.now(timezone.utc))
 
 def distance_km(lat1, lng1, lat2, lng2):
