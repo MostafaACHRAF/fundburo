@@ -293,7 +293,10 @@ def submit_match(payload: MatchCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code = 404, detail = "Item not found") 
 
     reverse_type = "found" if item.item_type == "lost" else "lost"
-    target_items_stmt = select(Item).where(Item.item_type == reverse_type)
+    target_items_stmt = select(Item).where(
+        Item.item_type == reverse_type,
+        Item.status == "active",
+    )
     target_items = db.scalars(target_items_stmt).all()
 
     matches: list[MatchItem] = []
