@@ -178,7 +178,10 @@ def resolve_coordinates(
     lat: float | None,
     lng: float | None,
 ) -> tuple[float | None, float | None]:
-    if lat is not None and lng is not None and not (lat == 0.0 and lng == 0.0):
+    lat_missing = lat is None or lat == 0.0
+    lng_missing = lng is None or lng == 0.0
+
+    if not lat_missing and not lng_missing:
         return lat, lng
 
     if address_text is None or not address_text.strip():
@@ -186,8 +189,8 @@ def resolve_coordinates(
 
     geocoded_lat, geocoded_lng = geocode_address(address_text)
 
-    final_lat = lat if lat is not None else geocoded_lat
-    final_lng = lng if lng is not None else geocoded_lng
+    final_lat = geocoded_lat if lat_missing else lat
+    final_lng = geocoded_lng if lng_missing else lng
     return final_lat, final_lng
 
 @app.post("/claims", response_model=ClaimCreateResponse)
