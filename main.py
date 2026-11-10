@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
+import os
 from math import radians, sin, cos, sqrt, atan2
+import re
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -18,6 +20,9 @@ app = FastAPI(title="LostAndFound API")
 
 GEOCODER_URL = "https://nominatim.openstreetmap.org/search"
 GEOCODER_USER_AGENT = "LostAndFound/1.0 (contact: support@lostandfound.local)"
+AI_EXTRACT_URL = os.getenv("AI_EXTRACT_URL", "https://api.openai.com/v1/chat/completions")
+AI_EXTRACT_MODEL = os.getenv("AI_EXTRACT_MODEL", "gpt-4o-mini")
+AI_EXTRACT_API_KEY = os.getenv("AI_EXTRACT_API_KEY")
 
 
 def get_db():
@@ -114,6 +119,48 @@ class ReportOut(BaseModel):
     status: str
     created_at: datetime
 
+
+class FreeTextCreate(BaseModel):
+    item_type: str
+    free_text: str
+
+
+class ExtractedItemFields(BaseModel):
+    description: str
+    color: str | None = None
+    size: str | None = None
+    usage: str | None = None
+    address_text: str | None = None
+    lat: float | None = None
+    lng: float | None = None
+    event_time: datetime | None = None
+    feel: str | None = None
+    smell: str | None = None
+    model: str | None = None
+    image_url: str | None = None
+
+
+class FreeTextExtractResponse(BaseModel):
+    item_type: str
+    free_text: str
+    extracted_fields: ExtractedItemFields
+    missing_fields: list[str]
+
+
+class IntakeApproveRequest(BaseModel):
+    username: str
+    email: EmailStr
+    item_type: str
+    free_text: str | None = None
+    extracted_fields: ExtractedItemFields
+
+
+class IntakeApproveResponse(BaseModel):
+    user_id: int
+    item_id: int
+    item_type: str
+    status: str
+
 class MatchCreate(BaseModel):
     item_id: int
 
@@ -206,6 +253,152 @@ def calculate_matches_for_item(db: Session, item: Item) -> list[MatchItem]:
 
     db.commit()
     return matches
+
+
+def normalize_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    normalized = normalize_text(value)
+    if normalized is None:
+        return None
+
+    try:
+        return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def sanitize_address_text(value: str | None) -> str | None:
+    normalized = normalize_text(value)
+    if normalized is None:
+        return None
+
+    cleaned = re.sub(
+        r"\s+(?:on|around|at)\s+\d{4}-\d{2}-\d{2}.*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    return cleaned or None
+
+
+def heuristic_extract_fields(free_text: str) -> dict:
+    address_match = re.search(
+        r"(?:near|at|in)\s+([A-Za-z0-9\s,.-]+?)(?=\s+(?:on|around)\s+\d{4}-\d{2}-\d{2}|$)",
+        free_text,
+        flags=re.IGNORECASE,
+    )
+    event_time_match = re.search(
+        r"(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)",
+        free_text,
+    )
+
+    return {
+        "description": free_text,
+        "color": None,
+        "size": None,
+        "usage": None,
+        "address_text": sanitize_address_text(address_match.group(1)) if address_match else None,
+        "lat": None,
+        "lng": None,
+        "event_time": event_time_match.group(1) if event_time_match else None,
+        "feel": None,
+        "smell": None,
+        "model": None,
+        "image_url": None,
+    }
+
+
+def extract_fields_with_ai(item_type: str, free_text: str) -> dict:
+    if not AI_EXTRACT_API_KEY:
+        return heuristic_extract_fields(free_text)
+
+    system_prompt = (
+        "You extract structured data for a lost-and-found application in Berlin. "
+        "Return JSON only with keys: description,color,size,usage,address_text,lat,lng,"
+        "event_time,feel,smell,model,image_url. "
+        "description must preserve user intent and include the core object description. "
+        "If a field is unknown, set it to null. "
+        "event_time must be ISO-8601 with timezone when possible."
+    )
+
+    user_prompt = (
+        f"Item type: {item_type}\n"
+        f"Free text:\n{free_text}"
+    )
+
+    request_payload = {
+        "model": AI_EXTRACT_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    request = Request(
+        url=AI_EXTRACT_URL,
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {AI_EXTRACT_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            content = payload["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                return parsed
+    except Exception:
+        pass
+
+    return heuristic_extract_fields(free_text)
+
+
+def normalize_extracted_fields(raw_fields: dict, free_text: str) -> dict:
+    description = normalize_text(raw_fields.get("description")) or free_text
+
+    normalized = {
+        "description": description,
+        "color": normalize_text(raw_fields.get("color")),
+        "size": normalize_text(raw_fields.get("size")),
+        "usage": normalize_text(raw_fields.get("usage")),
+        "address_text": sanitize_address_text(raw_fields.get("address_text")),
+        "lat": raw_fields.get("lat"),
+        "lng": raw_fields.get("lng"),
+        "event_time": raw_fields.get("event_time"),
+        "feel": normalize_text(raw_fields.get("feel")),
+        "smell": normalize_text(raw_fields.get("smell")),
+        "model": normalize_text(raw_fields.get("model")),
+        "image_url": normalize_text(raw_fields.get("image_url")),
+    }
+
+    if isinstance(normalized["event_time"], str):
+        normalized["event_time"] = parse_iso_datetime(normalized["event_time"])
+
+    return normalized
+
+
+def compute_missing_required_fields(fields: dict) -> list[str]:
+    missing_fields: list[str] = []
+    if not fields.get("description"):
+        missing_fields.append("description")
+    if not fields.get("address_text"):
+        missing_fields.append("address_text")
+    if fields.get("event_time") is None:
+        missing_fields.append("event_time")
+    return missing_fields
 
 
 def geocode_address(address_text: str) -> tuple[float | None, float | None]:
@@ -358,6 +551,100 @@ def submit_report(payload: ReportCreate, db: Session = Depends(get_db)):
     calculate_matches_for_item(db, item)
 
     return ReportCreateResponse(user_id=user.id, item_id=item.id, status=item.status)
+
+
+@app.post("/intake/extract", response_model=FreeTextExtractResponse)
+def extract_freetext(payload: FreeTextCreate):
+    if payload.item_type not in {"lost", "found"}:
+        raise HTTPException(status_code=400, detail="item_type must be 'lost' or 'found'")
+
+    normalized_text = payload.free_text.strip()
+    if not normalized_text:
+        raise HTTPException(status_code=400, detail="free_text cannot be empty")
+
+    ai_fields = extract_fields_with_ai(payload.item_type, normalized_text)
+    normalized_fields = normalize_extracted_fields(ai_fields, normalized_text)
+    missing_fields = compute_missing_required_fields(normalized_fields)
+
+    return FreeTextExtractResponse(
+        item_type=payload.item_type,
+        free_text=normalized_text,
+        extracted_fields=ExtractedItemFields(**normalized_fields),
+        missing_fields=missing_fields,
+    )
+
+
+@app.post("/intake/approve", response_model=IntakeApproveResponse)
+def approve_intake(payload: IntakeApproveRequest, db: Session = Depends(get_db)):
+    if payload.item_type not in {"lost", "found"}:
+        raise HTTPException(status_code=400, detail="item_type must be 'lost' or 'found'")
+
+    extracted = payload.extracted_fields.model_dump()
+    if payload.free_text is not None and payload.free_text.strip():
+        extracted["description"] = payload.free_text.strip()
+
+    missing_fields = compute_missing_required_fields(extracted)
+    if missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Missing required fields for approval",
+                "missing_fields": missing_fields,
+            },
+        )
+
+    user_stmt = select(AppUser).where(AppUser.email == payload.email)
+    user = db.scalar(user_stmt)
+
+    user_role = "claimer" if payload.item_type == "lost" else "reporter"
+    if user is None:
+        user = AppUser(username=payload.username, email=payload.email, role=user_role)
+        db.add(user)
+        db.flush()
+
+    lat, lng = resolve_coordinates(
+        address_text=extracted.get("address_text"),
+        lat=extracted.get("lat"),
+        lng=extracted.get("lng"),
+    )
+
+    if lat is None or lng is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Unable to resolve coordinates from address_text",
+                "address_text": extracted.get("address_text"),
+            },
+        )
+
+    item = Item(
+        user_id=user.id,
+        item_type=payload.item_type,
+        description=extracted["description"],
+        color=extracted.get("color"),
+        size=extracted.get("size"),
+        usage=extracted.get("usage"),
+        address_text=extracted.get("address_text"),
+        lat=lat,
+        lng=lng,
+        event_time=extracted.get("event_time"),
+        feel=extracted.get("feel"),
+        smell=extracted.get("smell"),
+        model=extracted.get("model"),
+        image_url=extracted.get("image_url"),
+    )
+
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    calculate_matches_for_item(db, item)
+
+    return IntakeApproveResponse(
+        user_id=user.id,
+        item_id=item.id,
+        item_type=item.item_type,
+        status=item.status,
+    )
 
 @app.get("/reports", response_model = list[ReportOut])
 def get_reports(db: Session = Depends(get_db)):
