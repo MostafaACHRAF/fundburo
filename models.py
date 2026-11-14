@@ -118,3 +118,16 @@ class ItemMatch(Base):
     found_item: Mapped[Item] = relationship(
         foreign_keys=[found_item_id], back_populates="found_matches"
     )
+
+
+class IntakeApprovalRecord(Base):
+    __tablename__ = "intake_approval_record"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    item_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("item.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

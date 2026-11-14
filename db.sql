@@ -38,3 +38,10 @@ create table item_match (
   created_at timestamptz not null default now(),
   unique (lost_item_id, found_item_id)
 );
+
+create table intake_approval_record (
+  id bigserial primary key,
+  idempotency_key text not null unique,
+  item_id bigint not null references item(id) on delete cascade,
+  created_at timestamptz not null default now()
+);

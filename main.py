@@ -10,10 +10,11 @@ from urllib.request import Request, urlopen
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, EmailStr
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
-from models import AppUser, Item, ItemMatch
+from models import AppUser, IntakeApprovalRecord, Item, ItemMatch
 
 
 app = FastAPI(title="LostAndFound API")
@@ -151,6 +152,7 @@ class IntakeApproveRequest(BaseModel):
     username: str
     email: EmailStr
     item_type: str
+    idempotency_key: str
     free_text: str | None = None
     extracted_fields: ExtractedItemFields
 
@@ -188,7 +190,11 @@ class MatchOut(BaseModel):
     created_at: datetime
 
 
-def calculate_matches_for_item(db: Session, item: Item) -> list[MatchItem]:
+def calculate_matches_for_item(
+    db: Session,
+    item: Item,
+    commit_changes: bool = True,
+) -> list[MatchItem]:
     reverse_type = "found" if item.item_type == "lost" else "lost"
     target_items_stmt = select(Item).where(
         Item.item_type == reverse_type,
@@ -251,7 +257,8 @@ def calculate_matches_for_item(db: Session, item: Item) -> list[MatchItem]:
             )
             matches.append(match)
 
-    db.commit()
+    if commit_changes:
+        db.commit()
     return matches
 
 
@@ -579,6 +586,30 @@ def approve_intake(payload: IntakeApproveRequest, db: Session = Depends(get_db))
     if payload.item_type not in {"lost", "found"}:
         raise HTTPException(status_code=400, detail="item_type must be 'lost' or 'found'")
 
+    idempotency_key = payload.idempotency_key.strip()
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="idempotency_key cannot be empty")
+
+    existing_record_stmt = select(IntakeApprovalRecord).where(
+        IntakeApprovalRecord.idempotency_key == idempotency_key
+    )
+    existing_record = db.scalar(existing_record_stmt)
+    if existing_record is not None:
+        existing_item_stmt = select(Item).where(Item.id == existing_record.item_id)
+        existing_item = db.scalar(existing_item_stmt)
+        if existing_item is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency record exists but item is missing",
+            )
+
+        return IntakeApproveResponse(
+            user_id=existing_item.user_id,
+            item_id=existing_item.id,
+            item_type=existing_item.item_type,
+            status=existing_item.status,
+        )
+
     extracted = payload.extracted_fields.model_dump()
     if payload.free_text is not None and payload.free_text.strip():
         extracted["description"] = payload.free_text.strip()
@@ -635,9 +666,54 @@ def approve_intake(payload: IntakeApproveRequest, db: Session = Depends(get_db))
     )
 
     db.add(item)
-    db.commit()
+    db.flush()
+    calculate_matches_for_item(db, item, commit_changes=False)
+
+    approval_record = IntakeApprovalRecord(
+        idempotency_key=idempotency_key,
+        item_id=item.id,
+    )
+    db.add(approval_record)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        constraint_name = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+        if constraint_name and "idempotency_key" in constraint_name:
+            existing_record_stmt = select(IntakeApprovalRecord).where(
+                IntakeApprovalRecord.idempotency_key == idempotency_key
+            )
+            existing_record = db.scalar(existing_record_stmt)
+            if existing_record is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Idempotency key conflict detected, but no existing record was found",
+                        "db_error": str(exc.orig),
+                    },
+                )
+
+            existing_item_stmt = select(Item).where(Item.id == existing_record.item_id)
+            existing_item = db.scalar(existing_item_stmt)
+            if existing_item is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Idempotency record exists but item is missing",
+                        "db_error": str(exc.orig),
+                    },
+                )
+
+            return IntakeApproveResponse(
+                user_id=existing_item.user_id,
+                item_id=existing_item.id,
+                item_type=existing_item.item_type,
+                status=existing_item.status,
+            )
+
+        raise HTTPException(status_code=409, detail=f"Database integrity error: {exc.orig}")
+
     db.refresh(item)
-    calculate_matches_for_item(db, item)
 
     return IntakeApproveResponse(
         user_id=user.id,
