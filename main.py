@@ -24,6 +24,11 @@ GEOCODER_USER_AGENT = "LostAndFound/1.0 (contact: support@lostandfound.local)"
 AI_EXTRACT_URL = os.getenv("AI_EXTRACT_URL", "https://api.openai.com/v1/chat/completions")
 AI_EXTRACT_MODEL = os.getenv("AI_EXTRACT_MODEL", "gpt-4o-mini")
 AI_EXTRACT_API_KEY = os.getenv("AI_EXTRACT_API_KEY")
+EMBEDDING_URL = os.getenv("EMBEDDING_URL", "https://api.openai.com/v1/embeddings")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", AI_EXTRACT_API_KEY)
+
+TEXT_MATCH_WEIGHT = 0.3
 
 
 def get_db():
@@ -202,9 +207,15 @@ def calculate_matches_for_item(
     )
     target_items = db.scalars(target_items_stmt).all()
 
+    item_embedding = get_text_embedding(item.description)
+
     matches: list[MatchItem] = []
     for target_item in target_items:
-        match_score = 0
+        match_score = 0.0
+
+        target_embedding = get_text_embedding(target_item.description)
+        description_similarity = embedding_cosine_similarity(item_embedding, target_embedding)
+        match_score += TEXT_MATCH_WEIGHT * description_similarity
 
         if target_item.event_time is not None and item.event_time is not None:
             time_distance = abs((item.event_time - target_item.event_time).total_seconds())
@@ -225,6 +236,8 @@ def calculate_matches_for_item(
                 distance = distance_km(item.lat, item.lng, target_item.lat, target_item.lng)
                 if distance <= 3:
                     match_score += 0.3
+
+        match_score = min(match_score, 1.0)
 
         if match_score >= 0.4:
             confidence = "high" if match_score >= 0.6 else "medium"
@@ -267,6 +280,66 @@ def normalize_text(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def get_text_embedding(text: str | None) -> list[float] | None:
+    normalized_text = normalize_text(text)
+    if normalized_text is None:
+        return None
+
+    if not EMBEDDING_API_KEY:
+        return None
+
+    payload = {
+        "model": EMBEDDING_MODEL,
+        "input": normalized_text,
+    }
+    request = Request(
+        url=EMBEDDING_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {EMBEDDING_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=12) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+            data = response_payload.get("data")
+            if not data:
+                return None
+
+            embedding = data[0].get("embedding")
+            if not isinstance(embedding, list):
+                return None
+
+            return [float(value) for value in embedding]
+    except Exception:
+        return None
+
+
+def embedding_cosine_similarity(vector1: list[float] | None, vector2: list[float] | None) -> float:
+    if vector1 is None or vector2 is None:
+        return 0.0
+
+    if len(vector1) == 0 or len(vector2) == 0 or len(vector1) != len(vector2):
+        return 0.0
+
+    dot_product = 0.0
+    norm1 = 0.0
+    norm2 = 0.0
+    for a, b in zip(vector1, vector2):
+        dot_product += a * b
+        norm1 += a * a
+        norm2 += b * b
+
+    if norm1 == 0.0 or norm2 == 0.0:
+        return 0.0
+
+    similarity = dot_product / (sqrt(norm1) * sqrt(norm2))
+    return max(0.0, min(1.0, similarity))
 
 
 def parse_iso_datetime(value: str | None) -> datetime | None:
