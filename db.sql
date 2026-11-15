@@ -1,5 +1,7 @@
 --create database find_n_lost;
 
+create extension if not exists vector;
+
 create table app_user (
   id bigserial primary key,
   username text not null,
@@ -24,6 +26,7 @@ create table item (
   smell text,
   model text,
   image_url text,
+  description_embedding vector(1536),
   created_at timestamptz not null default now(),
   expires_at timestamptz not null default (now() + interval '10 days'),
   status text not null default 'active' check (status in ('active','matched','expired'))
