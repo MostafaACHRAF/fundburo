@@ -207,13 +207,15 @@ def calculate_matches_for_item(
     )
     target_items = db.scalars(target_items_stmt).all()
 
-    item_embedding = get_text_embedding(item.description)
+    item_embedding = item.description_embedding or get_text_embedding(item.description)
 
     matches: list[MatchItem] = []
     for target_item in target_items:
         match_score = 0.0
 
-        target_embedding = get_text_embedding(target_item.description)
+        target_embedding = target_item.description_embedding or get_text_embedding(
+            target_item.description
+        )
         description_similarity = embedding_cosine_similarity(item_embedding, target_embedding)
         match_score += TEXT_MATCH_WEIGHT * description_similarity
 
@@ -566,6 +568,7 @@ def submit_claim(payload: ClaimCreate, db: Session = Depends(get_db)):
         user_id=user.id,
         item_type="lost",
         description=payload.description,
+        description_embedding=get_text_embedding(payload.description),
         color=payload.color,
         size=payload.size,
         usage=payload.usage,
@@ -613,6 +616,7 @@ def submit_report(payload: ReportCreate, db: Session = Depends(get_db)):
         user_id=user.id,
         item_type="found",
         description=payload.description,
+        description_embedding=get_text_embedding(payload.description),
         color=payload.color,
         size=payload.size,
         usage=payload.usage,
@@ -725,6 +729,7 @@ def approve_intake(payload: IntakeApproveRequest, db: Session = Depends(get_db))
         user_id=user.id,
         item_type=payload.item_type,
         description=extracted["description"],
+        description_embedding=get_text_embedding(extracted["description"]),
         color=extracted.get("color"),
         size=extracted.get("size"),
         usage=extracted.get("usage"),
